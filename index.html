@@ -39,6 +39,13 @@
     padding: 8px 14px; font-size: 15px; cursor: pointer; font-family: inherit;
   }
   button:hover, select:hover { border-color: #ffffff55; }
+  .vol {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--panel); border: 1px solid #ffffff1f; border-radius: 10px;
+    padding: 4px 12px; font-size: 15px;
+  }
+  .vol input { width: 110px; accent-color: #6b4dff; cursor: pointer; }
+  .vol span { min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
   button.primary { background: #6b4dff; border-color: #6b4dff; }
   button.active { background: #6b4dff; border-color: #6b4dff; }
 
@@ -113,10 +120,17 @@
   <button id="modeGame">節奏挑戰</button>
   <select id="song"></select>
   <select id="speed">
-    <option value="0.8">慢速</option>
+    <option value="0.4">超慢速 (40%)</option>
+    <option value="0.55">很慢 (55%)</option>
+    <option value="0.7">慢速 (70%)</option>
+    <option value="0.85">稍慢 (85%)</option>
     <option value="1" selected>正常</option>
     <option value="1.25">快速</option>
   </select>
+  <label class="vol" title="音量 (↑ / ↓ 調整)">🔊
+    <input id="vol" type="range" min="0" max="100" step="1" value="80">
+    <span id="volVal">80%</span>
+  </label>
   <button id="start" class="primary">開始 (空白鍵)</button>
 </div>
 
@@ -134,7 +148,7 @@
 
 <div class="pads" id="pads"></div>
 
-<footer>自由演奏：隨意敲擊。節奏挑戰：音符落到白線時按下對應按鍵。按 Esc 停止。</footer>
+<footer>自由演奏：隨意敲擊。節奏挑戰：音符落到白線時按下對應按鍵。按 Esc 停止，↑ / ↓ 調整音量。</footer>
 
 <script>
 // ---------- Drum kit ----------
@@ -151,10 +165,20 @@ const DRUMS = [
 const LANE_OF = Object.fromEntries(DRUMS.map((d, i) => [d.id, i]));
 
 let ac = null, master = null, noiseBuf = null;
+let volume = 0.8;
+try { const v = localStorage.getItem('kd-volume'); if (v !== null) volume = Math.min(1, Math.max(0, +v)); } catch (e) {}
+function setVolume(v) {
+  volume = Math.min(1, Math.max(0, v));
+  // perceptual curve so the low end of the slider is usable
+  if (master) master.gain.setTargetAtTime(volume * volume, ac.currentTime, 0.01);
+  const pct = Math.round(volume * 100);
+  volEl.value = pct; volValEl.textContent = pct + '%';
+  try { localStorage.setItem('kd-volume', volume); } catch (e) {}
+}
 function initAudio() {
   if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
   ac = new (window.AudioContext || window.webkitAudioContext)();
-  master = ac.createGain(); master.gain.value = 0.8;
+  master = ac.createGain(); master.gain.value = volume * volume;
   const comp = ac.createDynamicsCompressor();
   master.connect(comp).connect(ac.destination);
   noiseBuf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
@@ -252,7 +276,7 @@ const SONGS = [
 function buildChart(song, speed) {
   const bpm = song.bpm * speed;
   const step = 60 / bpm / 4;
-  const lead = 2.0; // seconds before first note
+  const lead = Math.max(2.0, 4 * 60 / bpm + 0.3); // room for a 4-beat count-in
   const notes = [];
   for (let bar = 0; bar < song.bars; bar++) {
     const pat = Object.assign({}, song.pattern, song.fills?.[bar] || {});
@@ -281,6 +305,10 @@ const padEls = DRUMS.map((d, i) => {
   padsEl.appendChild(el);
   return el;
 });
+
+const volEl = document.getElementById('vol'), volValEl = document.getElementById('volVal');
+volEl.addEventListener('input', () => setVolume(volEl.value / 100));
+setVolume(volume);
 
 const songSel = document.getElementById('song');
 SONGS.forEach((s, i) => songSel.add(new Option(s.name, i)));
@@ -317,6 +345,10 @@ function resetHud() { $('score').textContent = 0; $('combo').textContent = 0; $(
 const held = new Set();
 window.addEventListener('keydown', e => {
   if (e.target.tagName === 'SELECT') return;
+  if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+    e.preventDefault(); setVolume(volume + (e.key === 'ArrowUp' ? 0.05 : -0.05)); return;
+  }
+  if (e.target.tagName === 'INPUT') e.target.blur();
   const k = e.key.toLowerCase();
   if (k === ' ') { e.preventDefault(); if (!e.repeat) startGame(); return; }
   if (k === 'escape') { if (game) { stopGame(); showOverlay('<h2>已停止</h2><p>按空白鍵重新開始</p>'); } return; }
