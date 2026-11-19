@@ -97,6 +97,11 @@
   .pad .key { font-size: 26px; font-weight: 800; }
   .pad .name { font-size: 12px; color: var(--muted); margin-top: 4px; }
   .pad.hit { transform: scale(.93); background: var(--c); }
+  .pad.wait { animation: waitPulse .6s ease-in-out infinite alternate; }
+  @keyframes waitPulse {
+    from { box-shadow: 0 0 0 0 var(--c); }
+    to   { box-shadow: 0 0 18px 4px var(--c); transform: translateY(-3px); }
+  }
   .pad.hit .name { color: #000a; }
   .pad.hit .key { color: #000; }
 
@@ -128,9 +133,11 @@
     <option value="1.25">快速</option>
   </select>
   <label class="vol" title="音量 (↑ / ↓ 調整)">🔊
-    <input id="vol" type="range" min="0" max="100" step="1" value="80">
-    <span id="volVal">80%</span>
+    <input id="vol" type="range" min="0" max="100" step="1" value="100">
+    <span id="volVal">100%</span>
   </label>
+  <button id="waitBtn" title="音符停在白線，等你按對才繼續 (W)">⏸ 等我按：關</button>
+  <button id="bassBtn" class="active" title="貝斯伴奏 (B)">🎸 伴奏：開</button>
   <button id="start" class="primary">開始 (空白鍵)</button>
 </div>
 
@@ -148,7 +155,7 @@
 
 <div class="pads" id="pads"></div>
 
-<footer>自由演奏：隨意敲擊。節奏挑戰：音符落到白線時按下對應按鍵。按 Esc 停止，↑ / ↓ 調整音量。</footer>
+<footer>自由演奏：隨意敲擊。節奏挑戰：音符落到白線時按下對應按鍵。開啟「等我按」時音符會停在白線等你按對。按 Esc 停止，↑ / ↓ 調整音量，W 切換等我按，B 切換伴奏。</footer>
 
 <script>
 // ---------- Drum kit ----------
@@ -164,23 +171,34 @@ const DRUMS = [
 ];
 const LANE_OF = Object.fromEntries(DRUMS.map((d, i) => [d.id, i]));
 
-let ac = null, master = null, noiseBuf = null;
-let volume = 0.8;
+let ac = null, master = null, musicBus = null, noiseBuf = null;
+let volume = 1;
+const BOOST = 1.7; // overall loudness before the limiter
 try { const v = localStorage.getItem('kd-volume'); if (v !== null) volume = Math.min(1, Math.max(0, +v)); } catch (e) {}
 function setVolume(v) {
   volume = Math.min(1, Math.max(0, v));
-  // perceptual curve so the low end of the slider is usable
-  if (master) master.gain.setTargetAtTime(volume * volume, ac.currentTime, 0.01);
+  if (master) master.gain.setTargetAtTime(volGain(), ac.currentTime, 0.01);
   const pct = Math.round(volume * 100);
   volEl.value = pct; volValEl.textContent = pct + '%';
   try { localStorage.setItem('kd-volume', volume); } catch (e) {}
 }
+// gentle curve: quiet end stays usable, top end is loud
+function volGain() { return BOOST * Math.pow(volume, 1.5); }
 function initAudio() {
   if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
   ac = new (window.AudioContext || window.webkitAudioContext)();
-  master = ac.createGain(); master.gain.value = volume * volume;
+  master = ac.createGain(); master.gain.value = volGain();
+  // compressor -> makeup gain -> soft clipper: louder without harsh clipping
   const comp = ac.createDynamicsCompressor();
-  master.connect(comp).connect(ac.destination);
+  comp.threshold.value = -18; comp.knee.value = 8; comp.ratio.value = 6;
+  comp.attack.value = 0.003; comp.release.value = 0.2;
+  const makeup = ac.createGain(); makeup.gain.value = 1.9;
+  const clip = ac.createWaveShaper();
+  const curve = new Float32Array(2048);
+  for (let i = 0; i < curve.length; i++) { const x = i / 1023.5 - 1; curve[i] = Math.tanh(1.5 * x) / Math.tanh(1.5); }
+  clip.curve = curve; clip.oversample = '2x';
+  master.connect(comp).connect(makeup).connect(clip).connect(ac.destination);
+  musicBus = ac.createGain(); musicBus.gain.value = 0.55; musicBus.connect(master);
   noiseBuf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
   const d = noiseBuf.getChannelData(0);
   for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
@@ -196,103 +214,180 @@ function noise(t, dur, { type = 'highpass', freq = 7000, q = 1, gain = 0.5, atta
   src.connect(f).connect(g).connect(master);
   src.start(t); src.stop(t + dur + 0.05);
 }
-function tone(t, f0, f1, dur, gain, type = 'sine') {
+function tone(t, f0, f1, dur, gain, type = 'sine', out = master) {
   const o = ac.createOscillator(); o.type = type;
   o.frequency.setValueAtTime(f0, t);
   o.frequency.exponentialRampToValueAtTime(f1, t + dur);
   const g = ac.createGain();
   g.gain.setValueAtTime(gain, t);
   g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  o.connect(g).connect(master);
+  o.connect(g).connect(out);
   o.start(t); o.stop(t + dur + 0.05);
+}
+function bassNote(t, midi, dur) {
+  const f = 440 * Math.pow(2, (midi - 69) / 12);
+  const o1 = ac.createOscillator(); o1.type = 'sawtooth'; o1.frequency.value = f;
+  const o2 = ac.createOscillator(); o2.type = 'square'; o2.frequency.value = f / 2;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6;
+  lp.frequency.setValueAtTime(2200, t); lp.frequency.exponentialRampToValueAtTime(260, t + dur);
+  const g = ac.createGain(), g2 = ac.createGain(); g2.gain.value = 0.5;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.55, t + 0.006);
+  g.gain.setValueAtTime(0.55, t + dur * 0.6);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.08);
+  o1.connect(lp); o2.connect(g2).connect(lp); lp.connect(g).connect(musicBus);
+  o1.start(t); o2.start(t); o1.stop(t + dur + 0.1); o2.stop(t + dur + 0.1);
 }
 
 const SOUNDS = {
-  kick:  t => { tone(t, 150, 40, 0.45, 1.0); noise(t, 0.02, { type: 'lowpass', freq: 3000, gain: 0.3 }); },
-  snare: t => { tone(t, 220, 120, 0.12, 0.5, 'triangle'); noise(t, 0.22, { type: 'highpass', freq: 1500, gain: 0.6 }); },
-  hhc:   t => noise(t, 0.05, { type: 'highpass', freq: 8000, gain: 0.35 }),
-  hho:   t => noise(t, 0.4,  { type: 'highpass', freq: 7000, gain: 0.3 }),
-  tom1:  t => tone(t, 300, 180, 0.3, 0.7),
-  tom2:  t => tone(t, 200, 120, 0.35, 0.75),
-  tom3:  t => tone(t, 130, 75, 0.45, 0.85),
-  crash: t => { noise(t, 1.4, { type: 'highpass', freq: 4500, gain: 0.35, attack: 0.003 }); noise(t, 0.8, { type: 'bandpass', freq: 9000, q: 0.6, gain: 0.2 }); },
+  kick:  t => { tone(t, 170, 42, 0.5, 1.2); tone(t, 90, 40, 0.25, 0.6, 'triangle'); noise(t, 0.025, { type: 'lowpass', freq: 4000, gain: 0.5 }); },
+  snare: t => { tone(t, 240, 130, 0.13, 0.7, 'triangle'); noise(t, 0.25, { type: 'highpass', freq: 1400, gain: 0.8 }); noise(t, 0.12, { type: 'bandpass', freq: 3200, q: 0.8, gain: 0.5 }); },
+  hhc:   t => noise(t, 0.06, { type: 'highpass', freq: 7500, gain: 0.5 }),
+  hho:   t => noise(t, 0.45, { type: 'highpass', freq: 6500, gain: 0.42 }),
+  tom1:  t => { tone(t, 320, 180, 0.32, 0.9); noise(t, 0.03, { type: 'bandpass', freq: 2500, gain: 0.25 }); },
+  tom2:  t => { tone(t, 210, 120, 0.38, 0.95); noise(t, 0.03, { type: 'bandpass', freq: 2000, gain: 0.25 }); },
+  tom3:  t => { tone(t, 140, 75, 0.5, 1.05); noise(t, 0.03, { type: 'bandpass', freq: 1500, gain: 0.25 }); },
+  crash: t => { noise(t, 1.5, { type: 'highpass', freq: 4500, gain: 0.5, attack: 0.003 }); noise(t, 0.9, { type: 'bandpass', freq: 9000, q: 0.6, gain: 0.3 }); },
 };
 function play(id, t) { initAudio(); SOUNDS[id](t ?? ac.currentTime); }
 
 // ---------- Songs (patterns on a 16th-note grid) ----------
-// Each line: drum id + 16-char step string per bar ('x' = hit, '.' = rest)
+// pattern: drum id -> 16-step string ('x' = hit). May be an array of patterns that alternate per bar.
+// fills: bar index -> overrides. bass: 16-step string, chars = semitones above the bar's chord root
+// ('0'-'9','a','b', 'o' = octave up), prog = chord roots (semitones from root MIDI note) cycled per bar.
 const SONGS = [
   {
-    name: '入門搖滾 (90 BPM)', bpm: 90, bars: 8,
+    name: '入門搖滾 (90 BPM)', bpm: 90, bars: 8, root: 40, prog: [0, 0, 5, 7],
     pattern: {
       kick:  'x.......x.......',
       snare: '....x.......x...',
       hhc:   'x...x...x...x...',
     },
+    bass: '0.......0...0...',
     fills: { 7: { tom1: '........x.x.....', tom2: '............x...', tom3: '..............x.', snare: '....x...........' } },
-    ending: true,
   },
   {
-    name: '流行節拍 (100 BPM)', bpm: 100, bars: 8,
+    name: '流行節拍 (100 BPM)', bpm: 100, bars: 8, root: 43, prog: [0, 7, 9, 5],
     pattern: {
       kick:  'x.....x...x.....',
       snare: '....x.......x...',
       hhc:   'x.x.x.x.x.x.x.x.',
     },
+    bass: '0.....0...0.0...',
     fills: {
       3: { hho: '..............x.', hhc: 'x.x.x.x.x.x.x...' },
       7: { hhc: '................', snare: '....x...xxxx....', tom1: '............x...', tom2: '.............x..', tom3: '..............xx' },
     },
-    ending: true,
   },
   {
-    name: '放克律動 (95 BPM)', bpm: 95, bars: 8,
+    name: '🔥 迪斯可派對 (118 BPM)', bpm: 118, bars: 12, root: 45, prog: [0, 0, 5, 7],
+    pattern: {
+      kick:  'x...x...x...x...',
+      snare: '....x.......x...',
+      hhc:   'x...x...x...x...',
+      hho:   '..x...x...x...x.',
+    },
+    bass: '0.o.0.o.0.o.0.o.',
+    fills: {
+      3:  { snare: '....x.......x.xx' },
+      7:  { hho: '..x...x.........', snare: '....x...x.x.xxxx' },
+      11: { hho: '................', hhc: '................', snare: '....x...xxxx....', tom1: '............x...', tom2: '.............x..', tom3: '..............xx' },
+    },
+  },
+  {
+    name: '🔥 嘻哈 Boom Bap (88 BPM)', bpm: 88, bars: 12, root: 38, prog: [0, 0, 3, 5],
+    pattern: [
+      { kick: 'x.....x..x......', snare: '....x.......x...', hhc: 'x.x.x.x.x.x.x.x.' },
+      { kick: 'x.x...x..x....x.', snare: '....x.......x...', hhc: 'x.x.x.x.x.x.xxx.' },
+    ],
+    bass: '0.....0..0....3.',
+    fills: {
+      5:  { hho: '..............x.' },
+      11: { hhc: 'x.x.x.x.........', snare: '....x...x..x.x..', tom2: '..........x.....', tom3: '..............xx' },
+    },
+  },
+  {
+    name: '放克律動 (95 BPM)', bpm: 95, bars: 8, root: 40, prog: [0, 0, 5, 0],
     pattern: {
       kick:  'x..x..x...x..x..',
       snare: '....x.......x..x',
       hhc:   'xxxxxxxxxxxxxxxx',
     },
+    bass: '0..0..o...0..357',
     fills: {
       3: { hhc: 'xxxxxxxxxxxxxx..', hho: '..............x.' },
-      7: { hhc: 'xxxxxxxx........', tom1: '........xx......', tom2: '..........xx....', tom3: '............xx..', crash: '................' },
+      7: { hhc: 'xxxxxxxx........', tom1: '........xx......', tom2: '..........xx....', tom3: '............xx..' },
     },
-    ending: true,
   },
   {
-    name: '狂飆金屬 (130 BPM)', bpm: 130, bars: 8,
+    name: '🔥 拉丁森巴 (108 BPM)', bpm: 108, bars: 12, root: 41, prog: [0, 5, 7, 0],
+    pattern: [
+      { kick: 'x..xx..xx..xx..x', snare: '....x.......x...', hhc: 'x.x.x.x.x.x.x.x.', tom1: '..x.......x.....' },
+      { kick: 'x..xx..xx..xx..x', snare: '....x.......x...', hhc: 'x.x.x.x.x.x.x.x.', tom2: '......x.....x.x.' },
+    ],
+    bass: '0..7o..70..7o..7',
+    fills: {
+      5:  { tom1: '..x...x...x.....', tom2: '.......x...x....' },
+      11: { hhc: '................', kick: 'x...x...........', tom1: '..xx....x.......', tom2: '....xx....x.....', tom3: '......xx....xxxx' },
+    },
+  },
+  {
+    name: '狂飆金屬 (130 BPM)', bpm: 130, bars: 8, root: 40, prog: [0, 0, 1, 3],
     pattern: {
       kick:  'x.x.x.x.x.x.x.x.',
       snare: '....x.......x...',
       hho:   'x...x...x...x...',
     },
+    bass: '0.0.0.0.0.0.0.0.',
     fills: {
       3: { snare: '....x.......x.xx' },
       7: { hho: '................', kick: 'x.x.x.x.........', snare: '....x...x.x.....', tom1: '............x...', tom2: '.............x..', tom3: '..............xx' },
     },
-    ending: true,
+  },
+  {
+    name: '🔥 鼓打貝斯 D&B (160 BPM)', bpm: 160, bars: 12, root: 41, prog: [0, 0, 8, 10],
+    pattern: [
+      { kick: 'x.........x.....', snare: '....x.......x...', hhc: 'x.x.x.x.x.x.x.x.' },
+      { kick: 'x.x.......x..x..', snare: '....x.......x...', hhc: 'x.x.x.x.x.x.x.x.' },
+    ],
+    bass: '0.......o.....0.',
+    fills: {
+      3:  { hho: '..............x.' },
+      7:  { snare: '....x.......x.x.', hho: '..............x.' },
+      11: { hhc: '................', snare: '....x...x.x.x...', tom1: '............x...', tom2: '.............x..', tom3: '..............x.' },
+    },
   },
 ];
+const BASS_STEP = { o: 12, a: 10, b: 11 };
 
 function buildChart(song, speed) {
   const bpm = song.bpm * speed;
   const step = 60 / bpm / 4;
   const lead = Math.max(2.0, 4 * 60 / bpm + 0.3); // room for a 4-beat count-in
-  const notes = [];
+  const notes = [], music = [];
   for (let bar = 0; bar < song.bars; bar++) {
-    const pat = Object.assign({}, song.pattern, song.fills?.[bar] || {});
+    const base = Array.isArray(song.pattern) ? song.pattern[bar % song.pattern.length] : song.pattern;
+    const pat = Object.assign({}, base, song.fills?.[bar] || {});
     for (const [id, str] of Object.entries(pat)) {
       for (let i = 0; i < 16; i++) {
         if (str[i] === 'x') notes.push({ t: lead + (bar * 16 + i) * step, lane: LANE_OF[id], id });
       }
     }
     if (bar === 0) notes.push({ t: lead, lane: LANE_OF.crash, id: 'crash' });
+    const chord = song.root + song.prog[bar % song.prog.length];
+    for (let i = 0; i < 16; i++) {
+      const c = song.bass[i];
+      if (c === '.') continue;
+      const off = BASS_STEP[c] ?? parseInt(c, 10);
+      let len = 1; while (i + len < 16 && song.bass[i + len] === '.' && len < 3) len++;
+      music.push({ t: lead + (bar * 16 + i) * step, midi: chord + off, dur: step * len * 0.9 });
+    }
   }
-  if (song.ending) {
-    const t = lead + song.bars * 16 * step;
-    notes.push({ t, lane: LANE_OF.crash, id: 'crash' }, { t, lane: LANE_OF.kick, id: 'kick' });
-  }
+  const tEnd = lead + song.bars * 16 * step;
+  notes.push({ t: tEnd, lane: LANE_OF.crash, id: 'crash' }, { t: tEnd, lane: LANE_OF.kick, id: 'kick' });
+  music.push({ t: tEnd, midi: song.root, dur: 60 / bpm * 2 });
   notes.sort((a, b) => a.t - b.t);
-  return { notes, step, end: notes[notes.length - 1].t + 1.2, bpm, lead };
+  return { notes, music, step, end: tEnd + 1.2, bpm, lead };
 }
 
 // ---------- UI ----------
@@ -336,6 +431,29 @@ $('modeFree').onclick = () => setMode('free');
 $('modeGame').onclick = () => setMode('game');
 $('start').onclick = () => startGame();
 
+let waitMode = false, bassOn = true;
+try { waitMode = localStorage.getItem('kd-wait') === '1'; bassOn = localStorage.getItem('kd-bass') !== '0'; } catch (e) {}
+function renderToggles() {
+  $('waitBtn').textContent = '⏸ 等我按：' + (waitMode ? '開' : '關');
+  $('waitBtn').classList.toggle('active', waitMode);
+  $('bassBtn').textContent = '🎸 伴奏：' + (bassOn ? '開' : '關');
+  $('bassBtn').classList.toggle('active', bassOn);
+}
+function toggleWait() {
+  waitMode = !waitMode;
+  if (game) game.wait = waitMode;
+  try { localStorage.setItem('kd-wait', waitMode ? '1' : '0'); } catch (e) {}
+  renderToggles();
+}
+function toggleBass() {
+  bassOn = !bassOn;
+  try { localStorage.setItem('kd-bass', bassOn ? '1' : '0'); } catch (e) {}
+  renderToggles();
+}
+$('waitBtn').onclick = e => { e.currentTarget.blur(); toggleWait(); };
+$('bassBtn').onclick = e => { e.currentTarget.blur(); toggleBass(); };
+renderToggles();
+
 function showOverlay(html) { overlay.innerHTML = html; overlay.classList.remove('hidden'); }
 function hideOverlay() { overlay.classList.add('hidden'); }
 
@@ -351,6 +469,8 @@ window.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') e.target.blur();
   const k = e.key.toLowerCase();
   if (k === ' ') { e.preventDefault(); if (!e.repeat) startGame(); return; }
+  if (k === 'w' && !e.repeat) { toggleWait(); return; }
+  if (k === 'b' && !e.repeat) { toggleBass(); return; }
   if (k === 'escape') { if (game) { stopGame(); showOverlay('<h2>已停止</h2><p>按空白鍵重新開始</p>'); } return; }
   const i = DRUMS.findIndex(d => d.key === k);
   if (i < 0 || e.repeat || held.has(k)) return;
@@ -384,8 +504,8 @@ function startGame() {
     ...chart,
     notes: chart.notes.map(n => ({ ...n, state: 0 })), // 0 pending, 1 hit, 2 missed
     t0: ac.currentTime + 0.1,
-    score: 0, combo: 0, maxCombo: 0, perfect: 0, good: 0, miss: 0,
-    running: true, nextBeat: 0,
+    score: 0, combo: 0, maxCombo: 0, perfect: 0, good: 0, miss: 0, wrong: 0,
+    running: true, wait: waitMode, waiting: false, ptr: 0, mptr: 0, usedWait: waitMode,
   };
   // count-in metronome clicks during lead-in (one bar of quarter notes before start)
   const beat = 60 / game.bpm;
@@ -399,14 +519,43 @@ function startGame() {
 
 function stopGame() {
   if (game) game.running = false;
+  padEls.forEach(p => p.classList.remove('wait'));
   game = null;
   songSel.disabled = $('speed').disabled = false;
 }
 
-function songTime() { return ac.currentTime - game.t0; }
+// earliest note not yet hit/missed
+function gateTime() {
+  const n = game.notes;
+  while (game.ptr < n.length && n[game.ptr].state) game.ptr++;
+  return game.ptr < n.length ? n[game.ptr].t : Infinity;
+}
+
+// song clock; in wait mode it freezes at the first unhit note until it is played
+function songTime() {
+  let t = ac.currentTime - game.t0;
+  game.waiting = false;
+  if (game.wait) {
+    const gate = gateTime();
+    if (t > gate) { game.t0 += t - gate; t = gate; game.waiting = true; game.frozenGate = gate; }
+  }
+  return t;
+}
+
+function scheduleMusic(now) {
+  const notes = game.music, limit = now + 0.15;
+  const gate = game.wait ? gateTime() : Infinity;
+  while (game.mptr < notes.length && notes[game.mptr].t <= limit && notes[game.mptr].t < gate) {
+    const ev = notes[game.mptr++];
+    if (!bassOn) continue;
+    const at = game.t0 + ev.t;
+    if (at > ac.currentTime - 0.05) bassNote(Math.max(at, ac.currentTime), ev.midi, ev.dur);
+  }
+}
 
 function judgeHit(lane) {
   const now = songTime();
+  if (game.wait) return judgeWait(lane, now);
   let best = null, bestDt = Infinity;
   for (const n of game.notes) {
     if (n.state || n.lane !== lane) continue;
@@ -423,6 +572,29 @@ function judgeHit(lane) {
   else registerJudge(best, 'miss');
 }
 
+function judgeWait(lane, now) {
+  let note = null;
+  for (let i = game.ptr; i < game.notes.length; i++) {
+    const n = game.notes[i];
+    if (n.t > now + WIN_GOOD) break;
+    if (!n.state && n.lane === lane) { note = n; break; }
+  }
+  if (!note) { // wrong key
+    game.wrong++; game.combo = 0;
+    showJudge('按錯了', 'miss'); updateHud();
+    return;
+  }
+  const dt = Math.abs(note.t - now);
+  // a note the clock had to stop for counts as 'good'; on-time hits are still 'perfect'
+  registerJudge(note, dt <= WIN_PERFECT && game.frozenGate !== note.t ? 'perfect' : 'good');
+}
+
+function showJudge(text, kind) {
+  judgeEl.textContent = text;
+  judgeEl.style.color = `var(--${kind})`;
+  judgeEl.classList.remove('show'); void judgeEl.offsetWidth; judgeEl.classList.add('show');
+}
+
 function registerJudge(note, kind) {
   const g = game;
   if (kind === 'miss') {
@@ -434,10 +606,7 @@ function registerJudge(note, kind) {
     g[kind]++;
     burst(note.lane, DRUMS[note.lane].color, kind === 'perfect' ? 16 : 9);
   }
-  const text = { perfect: '完美!', good: '不錯', miss: '失誤' }[kind];
-  judgeEl.textContent = text;
-  judgeEl.style.color = `var(--${kind})`;
-  judgeEl.classList.remove('show'); void judgeEl.offsetWidth; judgeEl.classList.add('show');
+  showJudge({ perfect: '完美!', good: '不錯', miss: '失誤' }[kind], kind);
   updateHud();
 }
 
@@ -445,17 +614,17 @@ function updateHud() {
   const g = game;
   $('score').textContent = g.score;
   $('combo').textContent = g.combo;
-  const judged = g.perfect + g.good + g.miss;
+  const judged = g.perfect + g.good + g.miss + g.wrong;
   $('acc').textContent = judged ? ((g.perfect + g.good * 0.5) / judged * 100).toFixed(1) + '%' : '-';
 }
 
 function finishGame() {
   const g = game;
   const total = g.notes.length;
-  const acc = (g.perfect + g.good * 0.5) / total * 100;
+  const acc = (g.perfect + g.good * 0.5) / (total + g.wrong) * 100;
   const grade = acc >= 95 ? 'S' : acc >= 85 ? 'A' : acc >= 70 ? 'B' : acc >= 50 ? 'C' : 'D';
   const song = SONGS[+songSel.value];
-  const key = 'kd-best-' + songSel.value + '-' + $('speed').value;
+  const key = 'kd-best-' + song.name + '-' + $('speed').value + (g.usedWait ? '-wait' : '');
   let best = 0;
   try { best = +localStorage.getItem(key) || 0; if (g.score > best) localStorage.setItem(key, g.score); } catch (e) {}
   const newBest = g.score > best;
@@ -464,7 +633,8 @@ function finishGame() {
     <h2>${song.name}</h2>
     <div class="grade">${grade}</div>
     <p>分數 <b style="color:var(--text)">${g.score}</b>${newBest ? ' 🏆 新紀錄！' : `（最佳 ${best}）`}</p>
-    <p>完美 ${g.perfect}　不錯 ${g.good}　失誤 ${g.miss}　最大連擊 ${g.maxCombo}</p>
+    <p>完美 ${g.perfect}　不錯 ${g.good}　失誤 ${g.miss}${g.usedWait ? `　按錯 ${g.wrong}` : ''}　最大連擊 ${g.maxCombo}</p>
+    ${g.usedWait ? '<p>（等我按模式）</p>' : ''}
     <p>準確率 ${acc.toFixed(1)}%</p>
     <p style="margin-top:6px">按空白鍵再玩一次</p>`);
 }
@@ -509,6 +679,7 @@ function frame() {
 
   if (game && game.running) {
     const now = songTime();
+    scheduleMusic(now);
     // beat lines
     const beat = 60 / game.bpm;
     const firstBeat = Math.ceil((now - 0.3 - game.lead) / beat);
@@ -521,7 +692,7 @@ function frame() {
     }
     // notes
     for (const n of game.notes) {
-      if (n.state === 0 && now - n.t > WIN_GOOD) registerJudge(n, 'miss');
+      if (n.state === 0 && !game.wait && now - n.t > WIN_GOOD) registerJudge(n, 'miss');
       if (n.state === 1) continue;
       const y = HY - (n.t - now) * PX_PER_SEC;
       if (y < -20) break;
@@ -534,6 +705,17 @@ function frame() {
       roundRect(x + 10, y - 6, laneW - 20, 4, 2);
       ctx.globalAlpha = 1;
     }
+    // wait-mode hint: highlight the keys the song is waiting for
+    const waitLanes = new Set();
+    if (game.waiting) {
+      for (let i = game.ptr; i < game.notes.length && game.notes[i].t <= now + 1e-6; i++)
+        if (!game.notes[i].state) waitLanes.add(game.notes[i].lane);
+      const label = [...waitLanes].map(l => DRUMS[l].label).join(' + ');
+      ctx.font = 'bold 20px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#ffffffdd';
+      ctx.fillText('⏸ 等你按：' + label, W / 2, 30);
+    }
+    padEls.forEach((p, i) => p.classList.toggle('wait', waitLanes.has(i)));
     // progress bar
     ctx.fillStyle = '#6b4dff';
     ctx.fillRect(0, 0, W * Math.min(1, Math.max(0, now / game.end)), 3);
