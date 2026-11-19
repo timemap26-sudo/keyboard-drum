@@ -1,4 +1,4 @@
-# 🥁 鍵盤打鼓 Keyboard Drum
+# <img src="icon.svg" width="40" alt=""> 鍵盤打鼓 Keyboard Drum
 
 用電腦鍵盤打鼓的網頁遊戲，直接用瀏覽器打開 `index.html` 即可遊玩。
 
